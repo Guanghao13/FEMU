@@ -25,6 +25,24 @@ static inline void set_maptbl_ent(struct ssd *ssd, uint64_t lpn, struct ppa *ppa
     ssd->maptbl[lpn] = *ppa;
 }
 
+static void set_timetbl_ent(struct ssd *ssd, uint64_t lpn, int cmd)
+{
+    switch (cmd)
+    {
+    case NAND_WRITE:
+        ssd->timetbl[lpn].wtime[2] = ssd->timetbl[lpn].wtime[1];
+        ssd->timetbl[lpn].wtime[1] = ssd->timetbl[lpn].wtime[0];
+        ssd->timetbl[lpn].wtime[0] = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        break;
+    case NAND_READ:
+        ssd->timetbl[lpn].rtime[2] = ssd->timetbl[lpn].rtime[1];
+        ssd->timetbl[lpn].rtime[1] = ssd->timetbl[lpn].rtime[0];
+        ssd->timetbl[lpn].rtime[0] = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        break;
+    default:
+    } 
+}
+
 static uint64_t ppa2pgidx(struct ssd *ssd, struct ppa *ppa)
 {
     struct ssdparams *spp = &ssd->sp;
@@ -350,6 +368,21 @@ static void ssd_init_maptbl(struct ssd *ssd)
     }
 }
 
+static void ssd_init_timetbl(struct ssd *ssd)
+{
+    struct ssdparams *spp = &ssd->sp;
+
+    ssd->timetbl = g_malloc0(sizeof(struct timestamp) * spp->tt_pgs);
+    for (int i = 0; i < spp->tt_pgs; i++) {
+        ssd->timetbl[i].wtime = g_malloc0(sizeof(int64_t) * N_stamps);
+        ssd->timetbl[i].rtime = g_malloc0(sizeof(int64_t) * N_stamps);
+        for (int j = 0; j < N_stamps; j++){
+            ssd->timetbl[i].wtime[j] = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            ssd->timetbl[i].rtime[j] = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        }
+    }
+}
+
 static void ssd_init_rmap(struct ssd *ssd)
 {
     struct ssdparams *spp = &ssd->sp;
@@ -377,6 +410,9 @@ void ssd_init(FemuCtrl *n)
 
     /* initialize maptbl */
     ssd_init_maptbl(ssd);
+
+    /* initialize timetbl */
+    ssd_init_timetbl(ssd);
 
     /* initialize rmap */
     ssd_init_rmap(ssd);
@@ -792,6 +828,9 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
             continue;
         }
 
+        /* update timestamps */
+        set_timetbl_ent(ssd, lpn, NAND_READ);
+
         struct nand_cmd srd;
         srd.type = USER_IO;
         srd.cmd = NAND_READ;
@@ -838,6 +877,8 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         ppa = get_new_page(ssd);
         /* update maptbl */
         set_maptbl_ent(ssd, lpn, &ppa);
+        /* update timestamps */
+        set_timetbl_ent(ssd, lpn, NAND_WRITE);
         /* update rmap */
         set_rmap_ent(ssd, lpn, &ppa);
 
@@ -856,6 +897,22 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     }
 
     return maxlat;
+}
+
+static void output_timetbl(struct ssd *ssd) {
+    struct ssdparams *spp = &ssd->sp;
+    /* output every 30 seconds */
+    if( !( qemu_clock_get_ms(QEMU_CLOCK_REALTIME)/1000 % 30 ) ) {
+        FILE *fp = NULL;
+        fp = fopen("/home/guanghao/Desktop/femu_timetbl", "w+");
+        for (int i = 0; i < spp->tt_pgs; i++) {
+            for (int j = 0; j < N_stamps; j++){
+                fprintf(fp, "%ld %ld  ", ssd->timetbl[i].wtime[j], ssd->timetbl[i].rtime[j]);
+            }
+            fprintf(fp, "\n");
+        }
+        fclose(fp); 
+    }
 }
 
 static void *ftl_thread(void *arg)
@@ -914,6 +971,8 @@ static void *ftl_thread(void *arg)
                 do_gc(ssd, false);
             }
         }
+
+        output_timetbl(ssd);
     }
 
     return NULL;

@@ -69,6 +69,13 @@ struct ppa {
     };
 };
 
+/* describe latest write and read */
+#define N_stamps 3
+struct timestamp {
+    int64_t *wtime;
+    int64_t *rtime;
+};
+
 typedef int nand_sec_status_t;
 
 struct nand_page {
@@ -199,6 +206,7 @@ struct ssd {
     struct ssdparams sp;
     struct ssd_channel *ch;
     struct ppa *maptbl; /* page level mapping table */
+    struct timestamp *timetbl;
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
     struct write_pointer wp;
     struct line_mgmt lm;
