@@ -39,7 +39,7 @@ static void set_timetbl_ent(struct ssd *ssd, uint64_t lpn, int cmd)
         ssd->timetbl[lpn].rtime[1] = ssd->timetbl[lpn].rtime[0];
         ssd->timetbl[lpn].rtime[0] = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
         break;
-    default:
+    default: 
     } 
 }
 
