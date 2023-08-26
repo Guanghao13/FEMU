@@ -4,14 +4,16 @@
 
 static void *ftl_thread(void *arg);
 
-static inline bool should_gc(struct ssd *ssd)
+static inline bool should_gc(struct ssd *ssd, int k)
 {
-    return (ssd->lm.free_line_cnt <= ssd->sp.gc_thres_lines);
+    struct line_mgmt *lm = ssd->lm + k;
+    return (lm->free_line_cnt <= ssd->sp.gc_thres_lines/N_clusters);
 }
 
-static inline bool should_gc_high(struct ssd *ssd)
+static inline bool should_gc_high(struct ssd *ssd, int k)
 {
-    return (ssd->lm.free_line_cnt <= ssd->sp.gc_thres_lines_high);
+    struct line_mgmt *lm = ssd->lm + k;
+    return (lm->free_line_cnt <= ssd->sp.gc_thres_lines_high/N_clusters);
 }
 
 static inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
@@ -39,7 +41,21 @@ static void set_timetbl_ent(struct ssd *ssd, uint64_t lpn, int cmd)
         ssd->timetbl[lpn].rtime[1] = ssd->timetbl[lpn].rtime[0];
         ssd->timetbl[lpn].rtime[0] = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
         break;
-    default: 
+    default:
+    } 
+}
+
+static void set_freqtbl_ent(struct ssd *ssd, uint64_t lpn, int cmd)
+{
+    switch (cmd)
+    {
+    case NAND_WRITE:
+        ssd->freqtbl[lpn].w++;
+        break;
+    case NAND_READ:
+        ssd->freqtbl[lpn].r++;
+        break;
+    default:
     } 
 }
 
@@ -102,53 +118,68 @@ static inline void victim_line_set_pos(void *a, size_t pos)
 static void ssd_init_lines(struct ssd *ssd)
 {
     struct ssdparams *spp = &ssd->sp;
-    struct line_mgmt *lm = &ssd->lm;
     struct line *line;
+    ssd->lm = g_malloc0(sizeof(struct line_mgmt) * N_clusters);
+    struct line_mgmt *lm = ssd->lm;
 
-    lm->tt_lines = spp->blks_per_pl;
-    ftl_assert(lm->tt_lines == spp->tt_lines);
-    lm->lines = g_malloc0(sizeof(struct line) * lm->tt_lines);
+    for(int k = 0; k < N_clusters; k++) {
+        lm->tt_lines = (k==N_clusters-1) ? \
+                spp->blks_per_pl - spp->blks_per_pl/N_clusters * (N_clusters-1)  \
+                : spp->blks_per_pl/N_clusters;
+        ftl_assert(lm->tt_lines == spp->tt_lines);
+        lm->lines = g_malloc0(sizeof(struct line) * lm->tt_lines);
 
-    QTAILQ_INIT(&lm->free_line_list);
-    lm->victim_line_pq = pqueue_init(spp->tt_lines, victim_line_cmp_pri,
-            victim_line_get_pri, victim_line_set_pri,
-            victim_line_get_pos, victim_line_set_pos);
-    QTAILQ_INIT(&lm->full_line_list);
+        QTAILQ_INIT(&lm->free_line_list);
+        lm->victim_line_pq = pqueue_init(lm->tt_lines, victim_line_cmp_pri,
+                victim_line_get_pri, victim_line_set_pri,
+                victim_line_get_pos, victim_line_set_pos);
+        QTAILQ_INIT(&lm->full_line_list);
 
-    lm->free_line_cnt = 0;
-    for (int i = 0; i < lm->tt_lines; i++) {
-        line = &lm->lines[i];
-        line->id = i;
-        line->ipc = 0;
-        line->vpc = 0;
-        line->pos = 0;
-        /* initialize all the lines as free lines */
-        QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
-        lm->free_line_cnt++;
+        lm->free_line_cnt = 0;
+        for (int i = 0; i < lm->tt_lines; i++) {
+            line = &lm->lines[i];
+            line->id = i;
+            line->ipc = 0;
+            line->vpc = 0;
+            line->pos = 0;
+            /* initialize all the lines as free lines */
+            QTAILQ_INSERT_TAIL(&lm->free_line_list, line, entry);
+            lm->free_line_cnt++;
+        }
+
+        ftl_assert(lm->free_line_cnt == lm->tt_lines);
+        lm->victim_line_cnt = 0;
+        lm->full_line_cnt = 0;
+
+        /* go to next line_mgmt */
+        if(k < N_clusters - 1) lm++;
     }
-
-    ftl_assert(lm->free_line_cnt == lm->tt_lines);
-    lm->victim_line_cnt = 0;
-    lm->full_line_cnt = 0;
 }
 
 static void ssd_init_write_pointer(struct ssd *ssd)
 {
-    struct write_pointer *wpp = &ssd->wp;
-    struct line_mgmt *lm = &ssd->lm;
+    ssd->wp = g_malloc0(sizeof(struct write_pointer) * N_clusters);
+    struct write_pointer *wpp = ssd->wp;
+    struct line_mgmt *lm = ssd->lm;
     struct line *curline = NULL;
 
-    curline = QTAILQ_FIRST(&lm->free_line_list);
-    QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
-    lm->free_line_cnt--;
+    for(int k = 0; k < N_clusters; k++) {
 
-    /* wpp->curline is always our next-to-write super-block */
-    wpp->curline = curline;
-    wpp->ch = 0;
-    wpp->lun = 0;
-    wpp->pg = 0;
-    wpp->blk = 0;
-    wpp->pl = 0;
+        curline = QTAILQ_FIRST(&lm->free_line_list);
+        QTAILQ_REMOVE(&lm->free_line_list, curline, entry);
+        lm->free_line_cnt--;
+
+        /* wpp->curline is always our next-to-write super-block */
+        wpp->curline = curline;
+        wpp->ch = 0;
+        wpp->lun = 0;
+        wpp->pg = 0;
+        wpp->blk = ssd->boundary[k];
+        wpp->pl = 0;
+        if(k < N_clusters - 1) lm++;
+        if(k < N_clusters - 1) wpp++;
+    }
+
 }
 
 static inline void check_addr(int a, int max)
@@ -156,9 +187,9 @@ static inline void check_addr(int a, int max)
     ftl_assert(a >= 0 && a < max);
 }
 
-static struct line *get_next_free_line(struct ssd *ssd)
+static struct line *get_next_free_line(struct ssd *ssd, int k)
 {
-    struct line_mgmt *lm = &ssd->lm;
+    struct line_mgmt *lm = ssd->lm + k;
     struct line *curline = NULL;
 
     curline = QTAILQ_FIRST(&lm->free_line_list);
@@ -172,11 +203,18 @@ static struct line *get_next_free_line(struct ssd *ssd)
     return curline;
 }
 
-static void ssd_advance_write_pointer(struct ssd *ssd)
+static int line2blk(struct ssd *ssd, struct line *line, int k) 
+{
+    int blk = line->id;
+    blk += ssd->boundary[k];
+    return blk;
+}
+
+static void ssd_advance_write_pointer(struct ssd *ssd, int k)
 {
     struct ssdparams *spp = &ssd->sp;
-    struct write_pointer *wpp = &ssd->wp;
-    struct line_mgmt *lm = &ssd->lm;
+    struct write_pointer *wpp = ssd->wp + k;
+    struct line_mgmt *lm = ssd->lm + k;
 
     check_addr(wpp->ch, spp->nchs);
     wpp->ch++;
@@ -208,12 +246,14 @@ static void ssd_advance_write_pointer(struct ssd *ssd)
                 /* current line is used up, pick another empty line */
                 check_addr(wpp->blk, spp->blks_per_pl);
                 wpp->curline = NULL;
-                wpp->curline = get_next_free_line(ssd);
+                wpp->curline = get_next_free_line(ssd, k);
                 if (!wpp->curline) {
                     /* TODO */
                     abort();
                 }
+
                 wpp->blk = wpp->curline->id;
+                wpp->blk = line2blk(ssd, wpp->curline, k);
                 check_addr(wpp->blk, spp->blks_per_pl);
                 /* make sure we are starting from page 0 in the super block */
                 ftl_assert(wpp->pg == 0);
@@ -226,9 +266,9 @@ static void ssd_advance_write_pointer(struct ssd *ssd)
     }
 }
 
-static struct ppa get_new_page(struct ssd *ssd)
+static struct ppa get_new_page(struct ssd *ssd, int k)
 {
-    struct write_pointer *wpp = &ssd->wp;
+    struct write_pointer *wpp = ssd->wp + k;
     struct ppa ppa;
     ppa.ppa = 0;
     ppa.g.ch = wpp->ch;
@@ -383,6 +423,37 @@ static void ssd_init_timetbl(struct ssd *ssd)
     }
 }
 
+static void ssd_init_freqtbl(struct ssd *ssd)
+{
+    struct ssdparams *spp = &ssd->sp;
+
+    ssd->freqtbl = g_malloc0(sizeof(struct frequency) * spp->tt_pgs);
+    for (int i = 0; i < spp->tt_pgs; i++) {
+        ssd->freqtbl[i].w = 0;
+        ssd->freqtbl[i].r = 0;
+    }
+}
+
+static void ssd_init_clustertbl(struct ssd *ssd)
+{
+    struct ssdparams *spp = &ssd->sp;
+
+    ssd->clustertbl = g_malloc0(sizeof(int) * spp->tt_pgs);
+    for (int i = 0; i < spp->tt_pgs; i++) {
+        ssd->clustertbl[i] = N_clusters-1;
+    }
+}
+
+static void ssd_init_boundary(struct ssd *ssd)
+{
+    struct ssdparams *spp = &ssd->sp;
+
+    ssd->boundary = g_malloc0(sizeof(int) * N_clusters);
+    for (int i = 0; i<=N_clusters; i++) {
+        ssd->boundary[i] = i * (spp->tt_lines/N_clusters);
+    }
+}
+
 static void ssd_init_rmap(struct ssd *ssd)
 {
     struct ssdparams *spp = &ssd->sp;
@@ -400,6 +471,7 @@ void ssd_init(FemuCtrl *n)
 
     ftl_assert(ssd);
 
+
     ssd_init_params(spp);
 
     /* initialize ssd internal layout architecture */
@@ -414,6 +486,15 @@ void ssd_init(FemuCtrl *n)
     /* initialize timetbl */
     ssd_init_timetbl(ssd);
 
+    /* initialize freqtbl */
+    ssd_init_freqtbl(ssd);
+
+    /* initialize clustertbl */
+    ssd_init_clustertbl(ssd);
+
+    /* initialize boundaries of segments */
+    ssd_init_boundary(ssd);
+
     /* initialize rmap */
     ssd_init_rmap(ssd);
 
@@ -425,6 +506,7 @@ void ssd_init(FemuCtrl *n)
 
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
+
 }
 
 static inline bool valid_ppa(struct ssd *ssd, struct ppa *ppa)
@@ -478,9 +560,21 @@ static inline struct nand_block *get_blk(struct ssd *ssd, struct ppa *ppa)
     return &(pl->blk[ppa->g.blk]);
 }
 
+static inline int get_cluster(struct ssd *ssd, struct ppa *ppa)
+{
+    for (int k = 0; k < N_clusters; k++) {
+        if (ppa->g.blk < ssd->boundary[k])
+            return k-1;
+    }
+    return N_clusters-1;
+} 
+
 static inline struct line *get_line(struct ssd *ssd, struct ppa *ppa)
 {
-    return &(ssd->lm.lines[ppa->g.blk]);
+    int k = get_cluster(ssd, ppa);
+    struct line_mgmt *lm = ssd->lm + k;
+    int offset = ppa->g.blk - ssd->boundary[k];
+    return &(lm->lines[offset]);
 }
 
 static inline struct nand_page *get_pg(struct ssd *ssd, struct ppa *ppa)
@@ -563,12 +657,13 @@ static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
 /* update SSD status about one page from PG_VALID -> PG_VALID */
 static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
 {
-    struct line_mgmt *lm = &ssd->lm;
+    struct line_mgmt *lm = ssd->lm;
     struct ssdparams *spp = &ssd->sp;
     struct nand_block *blk = NULL;
     struct nand_page *pg = NULL;
     bool was_full_line = false;
     struct line *line;
+    int k;
 
     /* update corresponding page status */
     pg = get_pg(ssd, ppa);
@@ -584,6 +679,8 @@ static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
 
     /* update corresponding line status */
     line = get_line(ssd, ppa);
+    k = get_cluster(ssd, ppa);
+    lm += k; // move lm to corresponding cluster of the line
     ftl_assert(line->ipc >= 0 && line->ipc < spp->pgs_per_line);
     if (line->vpc == spp->pgs_per_line) {
         ftl_assert(line->ipc == 0);
@@ -670,7 +767,8 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
     uint64_t lpn = get_rmap_ent(ssd, old_ppa);
 
     ftl_assert(valid_lpn(ssd, lpn));
-    new_ppa = get_new_page(ssd);
+    int k = ssd->clustertbl[lpn];
+    new_ppa = get_new_page(ssd, k);
     /* update maptbl */
     set_maptbl_ent(ssd, lpn, &new_ppa);
     /* update rmap */
@@ -679,7 +777,7 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
     mark_page_valid(ssd, &new_ppa);
 
     /* need to advance the write pointer here */
-    ssd_advance_write_pointer(ssd);
+    ssd_advance_write_pointer(ssd, k);
 
     if (ssd->sp.enable_gc_delay) {
         struct nand_cmd gcw;
@@ -701,9 +799,9 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
     return 0;
 }
 
-static struct line *select_victim_line(struct ssd *ssd, bool force)
+static struct line *select_victim_line(struct ssd *ssd, bool force, int k)
 {
-    struct line_mgmt *lm = &ssd->lm;
+    struct line_mgmt *lm = ssd->lm + k;
     struct line *victim_line = NULL;
 
     victim_line = pqueue_peek(lm->victim_line_pq);
@@ -748,7 +846,8 @@ static void clean_one_block(struct ssd *ssd, struct ppa *ppa)
 
 static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
 {
-    struct line_mgmt *lm = &ssd->lm;
+    int k = get_cluster(ssd, ppa);
+    struct line_mgmt *lm = ssd->lm + k;
     struct line *line = get_line(ssd, ppa);
     line->ipc = 0;
     line->vpc = 0;
@@ -757,7 +856,7 @@ static void mark_line_free(struct ssd *ssd, struct ppa *ppa)
     lm->free_line_cnt++;
 }
 
-static int do_gc(struct ssd *ssd, bool force)
+static int do_gc(struct ssd *ssd, bool force, int k)
 {
     struct line *victim_line = NULL;
     struct ssdparams *spp = &ssd->sp;
@@ -765,12 +864,12 @@ static int do_gc(struct ssd *ssd, bool force)
     struct ppa ppa;
     int ch, lun;
 
-    victim_line = select_victim_line(ssd, force);
+    victim_line = select_victim_line(ssd, force, k);
     if (!victim_line) {
         return -1;
     }
 
-    ppa.g.blk = victim_line->id;
+    ppa.g.blk = line2blk(ssd, victim_line, k);
     ftl_debug("GC-ing line:%d,ipc=%d,victim=%d,full=%d,free=%d\n", ppa.g.blk,
               victim_line->ipc, ssd->lm.victim_line_cnt, ssd->lm.full_line_cnt,
               ssd->lm.free_line_cnt);
@@ -830,6 +929,8 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 
         /* update timestamps */
         set_timetbl_ent(ssd, lpn, NAND_READ);
+        /* update frequency */
+        set_freqtbl_ent(ssd, lpn, NAND_READ);
 
         struct nand_cmd srd;
         srd.type = USER_IO;
@@ -858,11 +959,14 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
 
-    while (should_gc_high(ssd)) {
-        /* perform GC here until !should_gc(ssd) */
-        r = do_gc(ssd, true);
-        if (r == -1)
-            break;
+    /* check all of the clusters whether should GC*/
+    for (int k = 0; k < N_clusters; k++) {
+        while (should_gc_high(ssd, k)) {
+            /* perform GC here until !should_gc(ssd) */
+            r = do_gc(ssd, true, k);
+            if (r == -1)
+                break;
+        }        
     }
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
@@ -874,19 +978,21 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         }
 
         /* new write */
-        ppa = get_new_page(ssd);
+        int k = ssd->clustertbl[lpn];
+        ppa = get_new_page(ssd, k);
         /* update maptbl */
         set_maptbl_ent(ssd, lpn, &ppa);
         /* update timestamps */
         set_timetbl_ent(ssd, lpn, NAND_WRITE);
+        /* update frequency */
+        set_freqtbl_ent(ssd, lpn, NAND_WRITE);
         /* update rmap */
         set_rmap_ent(ssd, lpn, &ppa);
 
         mark_page_valid(ssd, &ppa);
 
         /* need to advance the write pointer here */
-        ssd_advance_write_pointer(ssd);
-
+        ssd_advance_write_pointer(ssd, k);
         struct nand_cmd swr;
         swr.type = USER_IO;
         swr.cmd = NAND_WRITE;
@@ -901,16 +1007,43 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 
 static void output_timetbl(struct ssd *ssd) {
     struct ssdparams *spp = &ssd->sp;
-    /* output every 30 seconds */
-    if( !( qemu_clock_get_ms(QEMU_CLOCK_REALTIME)/1000 % 30 ) ) {
+    /* output every 60 seconds */
+    if( !( qemu_clock_get_ms(QEMU_CLOCK_REALTIME)/1000 % 60 ) ) {
         FILE *fp = NULL;
-        fp = fopen("/home/guanghao/Desktop/femu_timetbl", "w+");
-        for (int i = 0; i < spp->tt_pgs; i++) {
-            for (int j = 0; j < N_stamps; j++){
+        fp = fopen("/home/guanghao/Documents/FEMU/hw/femu/bbssd/femu_timetbl", "w+");
+        for (int i = SLICE_LEN/2; i < spp->tt_pgs; i+=SLICE_LEN) {
+            fprintf(fp, "%d  ", i);
+            for (int j = 0; j < N_stamps; j++) {
                 fprintf(fp, "%ld %ld  ", ssd->timetbl[i].wtime[j], ssd->timetbl[i].rtime[j]);
             }
-            fprintf(fp, "\n");
+            fprintf(fp, "%d %d  ", ssd->freqtbl[i].w, ssd->freqtbl[i].r);
+            (i+SLICE_LEN >= spp->tt_pgs) ? 0 : fprintf(fp, "\n");
         }
+        fclose(fp); 
+    }
+
+    /* update frequency: divide by 2 */
+    if( !( qemu_clock_get_ms(QEMU_CLOCK_REALTIME)/1000 % 600 ) ) {
+        for (int i = 0; i < spp->tt_pgs; i++) {
+            ssd->freqtbl[i].w /= 2;
+            ssd->freqtbl[i].r /= 2;
+        }
+    }
+}
+
+static void input_clusters(struct ssd *ssd) {
+    struct ssdparams *spp = &ssd->sp;
+    if( !( qemu_clock_get_ms(QEMU_CLOCK_REALTIME)/1000 % 60 ) ) {
+        FILE *fp = NULL;
+        fp = fopen("/home/guanghao/Documents/FEMU/hw/femu/bbssd/clusters", "r");
+        char a;
+        for(int i = SLICE_LEN/2; i < spp->tt_pgs; i+=SLICE_LEN) {
+            a = fgetc(fp);
+            ssd->clustertbl[i] = a-'0';
+            a = fgetc(fp);  // this is '\n'
+        }
+        for(int i=0; i < spp->tt_pgs; i++)
+            ssd->clustertbl[i] = ssd->clustertbl[i/SLICE_LEN*SLICE_LEN + SLICE_LEN/2];
         fclose(fp); 
     }
 }
@@ -967,14 +1100,16 @@ static void *ftl_thread(void *arg)
             }
 
             /* clean one line if needed (in the background) */
-            if (should_gc(ssd)) {
-                do_gc(ssd, false);
+            for (int k = 0; k < N_clusters; k++) {
+                if (should_gc(ssd, k)) {
+                    do_gc(ssd, false, k);
+                }
             }
         }
 
         output_timetbl(ssd);
+        input_clusters(ssd);
     }
 
     return NULL;
 }
-

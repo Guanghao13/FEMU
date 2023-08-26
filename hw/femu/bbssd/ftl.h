@@ -75,6 +75,15 @@ struct timestamp {
     int64_t *wtime;
     int64_t *rtime;
 };
+/* count recent write and read  */
+struct frequency {
+    int w;
+    int r;
+};
+/* pages of a slice */
+#define SLICE_LEN 1024
+/* number of clusters (or segment) */
+#define N_clusters 5
 
 typedef int nand_sec_status_t;
 
@@ -207,9 +216,12 @@ struct ssd {
     struct ssd_channel *ch;
     struct ppa *maptbl; /* page level mapping table */
     struct timestamp *timetbl;
+    struct frequency *freqtbl;
+    int *clustertbl;
+    int *boundary;
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
-    struct write_pointer wp;
-    struct line_mgmt lm;
+    struct write_pointer *wp;
+    struct line_mgmt *lm;
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;
